@@ -1,154 +1,121 @@
 /**
- * Backend Apps Script untuk "Pusat Data Operasional".
+ * PUSAT DATA OPERASIONAL — Web App Apps Script
+ * ------------------------------------------------
+ * Kode ini membaca data dari Google Sheet secara otomatis.
+ * Kalau ada baris baru ditambahkan di sheet, link baru akan
+ * ikut muncul di halaman tanpa perlu ubah kode.
  *
- * Karena frontend sekarang di-hosting terpisah (React di Netlify), kita tidak
- * bisa lagi pakai google.script.run (itu hanya jalan kalau HTML-nya disajikan
- * langsung oleh Apps Script). Sebagai gantinya, Web App ini bertindak sebagai
- * REST-ish JSON API yang dipanggil lewat fetch() dari React:
+ * STRUKTUR SHEET YANG DIBACA (sheet pertama / gid=0):
+ * Kolom A -> Nama Link
+ * Kolom B -> Link (URL)
+ * Kolom C -> Kategori (opsional, boleh dikosongkan)
+ * Kolom D -> Detail / isi rekap (opsional, boleh dikosongkan)
+ *            contoh: "Rekap Persiapan, Rekap Clearing, Rekap Workbench, Rekap Kelasahan Persiapan"
  *
- *   GET  {url}?action=list                -> daftar semua link
- *   POST {url}  body: { action:"add",    nama, url, kategori, detail }
- *   POST {url}  body: { action:"delete", rowNumber, nama }
- *
- * PENTING soal CORS:
- * Apps Script Web App tidak bisa merespons preflight OPTIONS dengan header
- * CORS custom. Supaya browser TIDAK mengirim preflight, request dari frontend
- * harus tetap berupa "simple request":
- *   - GET tanpa header custom
- *   - POST dengan Content-Type: text/plain;charset=utf-8 (bukan application/json)
- * Body POST tetap JSON string, dan di sini kita parse manual dari
- * e.postData.contents. Selama frontend (src/api.ts) mengikuti pola ini,
- * tidak perlu header CORS tambahan.
- *
- * SETUP SHEET:
- * Sheet bernama "Links" dengan header di baris 1:
- *   A: Nama | B: URL | C: Kategori | D: Detail
- * Data mulai dari baris 2. rowNumber yang dikirim ke frontend = nomor baris
- * asli di sheet, dipakai untuk update/hapus.
- *
- * DEPLOY:
- * Deploy > New deployment > Web app > Execute as: Me > Who has access: Anyone.
- * Pakai URL /exec yang dihasilkan sebagai VITE_APPS_SCRIPT_URL di frontend.
+ * Baris 1 dianggap header dan dilewati.
  */
 
-var SHEET_NAME = 'Links';
+// ID spreadsheet sudah diisi sesuai link yang diberikan
+const SPREADSHEET_ID = '1sYZMUWa9i_c0coEIPt_rWkgTLlo4Ps3rKsr0i0enZW4';
+const SHEET_NAME = 'Sheet1'; // ganti jika nama tab sheet berbeda
 
-function getSheet_() {
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
-  var sheet = ss.getSheetByName(SHEET_NAME);
-  if (!sheet) {
-    sheet = ss.insertSheet(SHEET_NAME);
-    sheet.appendRow(['Nama', 'URL', 'Kategori', 'Detail']);
-  }
-  return sheet;
+function doGet() {
+  const template = HtmlService.createTemplateFromFile('Index');
+  template.links = getLinksFromSheet();
+  return template
+    .evaluate()
+    .setTitle('Pusat Data Operasional')
+    .addMetaTag('viewport', 'width=device-width, initial-scale=1')
+    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
 }
 
-function readLinks_() {
-  var sheet = getSheet_();
-  var lastRow = sheet.getLastRow();
-  if (lastRow < 2) return [];
+/**
+ * Membaca semua baris data dari sheet dan mengembalikannya
+ * sebagai array of object supaya mudah ditampilkan di HTML.
+ */
+function getLinksFromSheet() {
+  const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
+  const sheet = ss.getSheetByName(SHEET_NAME) || ss.getSheets()[0];
+  const data = sheet.getDataRange().getValues();
 
-  var values = sheet.getRange(2, 1, lastRow - 1, 4).getValues();
-  var links = [];
-  for (var i = 0; i < values.length; i++) {
-    var row = values[i];
-    var nama = String(row[0] || '').trim();
-    var url = String(row[1] || '').trim();
-    if (!nama && !url) continue; // lewati baris kosong
+  const links = [];
+  // mulai dari baris ke-2 (index 1) supaya header dilewati
+  for (let i = 1; i < data.length; i++) {
+    const nama = data[i][0];
+    const url = data[i][1];
+    const kategori = data[i][2] || '';
+    const detail = data[i][3] || '';
+
+    // lewati baris kosong
+    if (!nama || !url) continue;
+
     links.push({
-      rowNumber: i + 2,
-      nama: nama,
-      url: url,
-      kategori: String(row[2] || '').trim(),
-      detail: String(row[3] || '').trim(),
+      nama: nama.toString().trim(),
+      url: url.toString().trim(),
+      kategori: kategori.toString().trim(),
+      detail: detail.toString().trim(),
+      rowNumber: i + 1 // nomor baris asli di sheet (1-indexed, sesuai tampilan Google Sheets)
     });
   }
   return links;
 }
 
-function jsonOut_(payload) {
-  return ContentService.createTextOutput(JSON.stringify(payload)).setMimeType(
-    ContentService.MimeType.JSON
-  );
+/**
+ * Dipanggil dari HTML (google.script.run) untuk me-refresh
+ * daftar link tanpa perlu reload halaman.
+ */
+function refreshLinks() {
+  return getLinksFromSheet();
 }
 
-function ok_(data) {
-  return jsonOut_({ ok: true, data: data });
-}
-
-function fail_(message) {
-  return jsonOut_({ ok: false, message: message });
-}
-
-/** Menangani GET (dipakai untuk action=list). */
-function doGet(e) {
-  try {
-    var action = (e && e.parameter && e.parameter.action) || 'list';
-    if (action === 'list') {
-      return ok_(readLinks_());
-    }
-    return fail_('Action tidak dikenal: ' + action);
-  } catch (err) {
-    return fail_(err.message);
-  }
-}
-
-/** Menangani POST (action=add / action=delete). */
-function doPost(e) {
-  try {
-    var body = {};
-    if (e && e.postData && e.postData.contents) {
-      body = JSON.parse(e.postData.contents);
-    } else if (e && e.parameter) {
-      body = e.parameter;
-    }
-
-    var action = body.action;
-
-    if (action === 'add') {
-      return ok_(addLinkRow_(body.nama, body.url, body.kategori, body.detail));
-    }
-
-    if (action === 'delete') {
-      return ok_(deleteLinkRow_(Number(body.rowNumber), body.nama));
-    }
-
-    return fail_('Action tidak dikenal: ' + action);
-  } catch (err) {
-    return fail_(err.message);
-  }
-}
-
-function addLinkRow_(nama, url, kategori, detail) {
-  nama = String(nama || '').trim();
-  url = String(url || '').trim();
+/**
+ * Dipanggil dari form "Tambah Link" di HTML untuk menambahkan
+ * baris baru ke sheet secara langsung dari halaman web.
+ */
+function addLink(nama, url, kategori, detail) {
   if (!nama || !url) {
-    throw new Error('Nama Link dan Alamat Link wajib diisi.');
+    throw new Error('Nama dan Link wajib diisi.');
   }
 
-  var sheet = getSheet_();
-  sheet.appendRow([nama, url, String(kategori || '').trim(), String(detail || '').trim()]);
-  return readLinks_();
+  const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
+  const sheet = ss.getSheetByName(SHEET_NAME) || ss.getSheets()[0];
+
+  sheet.appendRow([
+    nama.toString().trim(),
+    url.toString().trim(),
+    (kategori || '').toString().trim(),
+    (detail || '').toString().trim()
+  ]);
+
+  // kembalikan daftar terbaru supaya halaman langsung ter-update
+  return getLinksFromSheet();
 }
 
-function deleteLinkRow_(rowNumber, nama) {
-  if (!rowNumber || rowNumber < 2) {
-    throw new Error('rowNumber tidak valid.');
+/**
+ * Dipanggil dari tombol "Hapus" di HTML untuk menghapus satu baris
+ * dari sheet berdasarkan rowNumber (nomor baris asli di sheet, sesuai
+ * yang dikirim balik oleh getLinksFromSheet). Nama link juga dicocokkan
+ * ulang di sini sebagai lapisan validasi kedua (selain konfirmasi ketik
+ * ulang nama yang sudah dilakukan di halaman web), supaya baris yang
+ * terhapus benar-benar sesuai dengan yang dimaksud pengguna.
+ */
+function deleteLink(rowNumber, namaKonfirmasi) {
+  const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
+  const sheet = ss.getSheetByName(SHEET_NAME) || ss.getSheets()[0];
+  const lastRow = sheet.getLastRow();
+
+  if (!rowNumber || rowNumber < 2 || rowNumber > lastRow) {
+    throw new Error('Data tidak ditemukan, mungkin sudah dihapus sebelumnya.');
   }
 
-  var sheet = getSheet_();
-  var lastRow = sheet.getLastRow();
-  if (rowNumber > lastRow) {
-    throw new Error('Baris tidak ditemukan (mungkin sudah terhapus).');
-  }
+  const namaDiBaris = sheet.getRange(rowNumber, 1).getValue().toString().trim();
 
-  // Verifikasi nama cocok, jaga-jaga kalau baris sudah bergeser sejak
-  // frontend terakhir memuat data.
-  var namaDiSheet = String(sheet.getRange(rowNumber, 1).getValue() || '').trim();
-  if (nama && namaDiSheet && namaDiSheet !== String(nama).trim()) {
-    throw new Error('Data sudah berubah, silakan muat ulang sebelum menghapus.');
+  if (!namaKonfirmasi || namaDiBaris !== namaKonfirmasi.toString().trim()) {
+    throw new Error('Nama link tidak cocok dengan baris yang dipilih, penghapusan dibatalkan.');
   }
 
   sheet.deleteRow(rowNumber);
-  return readLinks_();
+
+  // kembalikan daftar terbaru supaya halaman langsung ter-update
+  return getLinksFromSheet();
 }
